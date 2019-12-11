@@ -59,10 +59,10 @@ volatile bool respostaRecebida = false;
 volatile bool requisicaoEnviada = false;
 volatile bool requisicaoTimeOutEnviada = false;
 
-static enum StatusUart {
+volatile static enum StatusUart {
 	TransmitirReq, Idle, ErroCheckSum, ErroConexao
 } statusUart = Idle;
-static enum StatusPrograma {
+volatile static enum StatusPrograma {
 	Relogio, EditarRelogio, Conversor, ConexaoUART
 } statusPrograma = ConexaoUART;
 /* USER CODE END PV */
