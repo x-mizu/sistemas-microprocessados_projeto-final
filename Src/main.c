@@ -38,7 +38,7 @@ enum StatusPrograma {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define DT_D 500					// delay dos leds
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,14 +52,18 @@ ADC_HandleTypeDef hadc1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-volatile uint8_t buffOut[4]; // buffer de saida
-volatile uint8_t buffIn[4]; // buffer de entrada
+volatile uint8_t buffOut = { 0, 0, 0, 0 }; // buffer de saida
+volatile uint8_t buffIn = { 0, 0, 0, 0 }; // buffer de entrada
 volatile uint16_t valorConversorRecebido; // valor recebido pela UART
 volatile uint16_t valorConversor; // valor do conversor
 uint8_t r = (uint8_t) 0x72; // byte de requisicao
 uint8_t requisicoesCheckSumIncorretoMAX = 3; // numero maximo de requisoces
 volatile uint8_t requisicaoAtual = 1; // numero maximo de requisoces
 uint16_t tempoRespostaMAX = 500; // tempo maximo de resposta
+uint16_t tempoRequiscoes = 200; // tempo entre requisicoes
+volatile bool respostaRecebida = false;
+volatile bool requisicaoEnviada = false;
+volatile bool requisicaoTimeOutEnviada = false;
 volatile StatusUart statusUart = Receber; // status da uart
 volatile StatusPrograma statusPrograma = Relogio; // status do programa
 /* USER CODE END PV */
@@ -116,6 +120,29 @@ int main(void) {
 	MX_NVIC_Init();
 	/* USER CODE BEGIN 2 */
 	HAL_UART_Receive_IT(&huart1, buffIn, sizeof(buffIn)); // inicializa buffer de entrada
+
+	HAL_GPIO_WritePin(GPIOB,
+	GPIO_PIN_15 | GPIO_PIN_14 | GPIO_PIN_13 | GPIO_PIN_12, GPIO_PIN_SET); // desliga os leds
+
+	static enum {
+		INI_D1, LIG_D1, DSLG_D1
+	} sttD1 = INI_D1; // var estados de D1
+	static enum {
+		INI_D2, LIG_D2, DSLG_D2
+	} sttD2 = INI_D2; // var estados de D2
+	static enum {
+		INI_D3, LIG_D3, DSLG_D3
+	} sttD3 = INI_D3; // var estados de D3
+	static enum {
+		INI_D4, LIG_D4, DSLG_D4
+	} sttD4 = INI_D4; // var estados de D4
+
+	// para controlar vars tempos de entrada na rotina ON/OFF de cada LED
+	uint32_t tin_D1 = 0, tin_D2 = 0, tin_D3 = 0, tin_D4 = 0;
+
+	// para controlar as vezes que uma requisicao sera feita
+	uint32_t tin_UART = 0, timeOut_UART = 0;
+
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -125,20 +152,96 @@ int main(void) {
 
 		/* USER CODE BEGIN 3 */
 
-		/// Conexao UART
+		/// Conexao UART -------------------------------------------------------
 		if (statusPrograma == ConexaoUART) {
 			switch (statusUart) {
 			case Idle:
+				tin_UART = HAL_GetTick();
+				timeOut_UART = HAL_GetTick();
+				respostaRecebida = false;
+				requisicaoEnviada = false;
+				requisicaoTimeOutEnviada = false;
 				statusUart = TransmitirReq;
 				break;
 			case TransmitirReq: // se o status for de enviar uma requisicao
-				TransmitirRequisicaoUART();
-				break;
-			case ErroCheckSum: // se o status for de erro de checksum
+
+				if ((HAL_GetTick() - tin_UART) > tempoRequiscoes
+						&& requisicaoEnviada == false) { // se for tempo de fazer uma requisicao
+					tin_UART = HAL_GetTick();
+					timeOut_UART = HAL_GetTick();
+					requisicaoEnviada = true;
+					TransmitirRequisicaoUART();
+				}
+
+				// se deu 500 ms, envia mais uma requisicao
+				if ((HAL_GetTick() - timeOut_UART) > tempoRespostaMAX
+						&& requisicaoTimeOutEnviada == false) {
+					requisicaoTimeOutEnviada = true;
+					TransmitirRequisicaoUART();
+				}
+
+				// se depois da requisicao de 500ms, ainda nao recebi resposta depois de 500ms
+				// erro de conexao
+				if ((HAL_GetTick() - timeOut_UART) > 2 * tempoRespostaMAX) {
+					statusUart = ErroConexao;
+				}
+
+				// recebi resposta, reseta variaveis de requisicao
+				if (respostaRecebida == true) {
+					requisicaoTimeOutEnviada = false;
+					requisicaoEnviada = false;
+				}
 
 				break;
-			case ErroConexao: // se o status for de erro de conexao
-
+			case ErroCheckSum: // se o status for de erro de checksum pisca LED 3
+				switch (sttD3) {
+				case INI_D3: // vai iniciar a máquina de estado
+					tin_D3 = HAL_GetTick(); // tempo inicial que iniciou a tarefa
+					sttD3 = LIG_D3; // prox estado da máquina
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); // desl o LED
+					break;
+				case LIG_D3: // estado para ligar o LED
+					if ((HAL_GetTick() - tin_D3) > DT_D) // se for hora de ligar o led
+							{
+						tin_D3 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+						sttD3 = DSLG_D3; // muda o prox estado da máquina
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); // ligaLED
+					}
+					break;
+				case DSLG_D3: // estado para desligar o LED
+					if ((HAL_GetTick() - tin_D3) > DT_D) // se for hora de desligar o led
+							{
+						tin_D3 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+						sttD3 = LIG_D3; // muda o prox estado da máquina
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); // desl LED
+					}
+					break;
+				}
+				break;
+			case ErroConexao: // se o status for de erro de conexao pisca LED 4
+				switch (sttD4) {
+				case INI_D4: // vai iniciar a máquina de estado
+					tin_D4 = HAL_GetTick(); // tempo inicial que iniciou a tarefa
+					sttD4 = LIG_D4; // prox estado da máquina
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); // desl o LED
+					break;
+				case LIG_D4: // estado para ligar o LED
+					if ((HAL_GetTick() - tin_D4) > DT_D) // se for hora de ligar o led
+					{
+						tin_D4 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+						sttD4 = DSLG_D4; // muda o prox estado da máquina
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); // ligaLED
+					}
+					break;
+				case DSLG_D4: // estado para desligar o LED
+					if ((HAL_GetTick() - tin_D4) > DT_D) // se for hora de desligar o led
+					{
+						tin_D4 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+						sttD4 = LIG_D4; // muda o prox estado da máquina
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); // desl LED
+					}
+					break;
+				}
 				break;
 			}
 		} else {
@@ -333,9 +436,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
 			TransmitirDadosUART();
 
-		} else { // senao se eu estou esperando um dado
+		} else { // senao eu estou recebendo um dado
 			uint16_t checkSumCalculado = (uint16_t) buffIn[0] + buffIn[1]; // faz a soma da parte alta com a baixa
 			uint16_t checkSumRecebido = ((uint16_t) buffIn[2] << 8) | buffIn[3]; // monta o checksum recebido
+
+			respostaRecebida = false; // recebi uma resposta
 
 			if (checkSumCalculado == checkSumRecebido) { // se o checksum for correto
 				// salva valor recebido em uma variavel de 16 bits
@@ -349,8 +454,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 				if (requisicaoAtual > requisicoesCheckSumIncorretoMAX) { // se ja foi enviado 3 requisicoes
 					statusUart = ErroCheckSum; // atribui status de erro
 					requisicaoAtual = 1;
-				} else { // senao envia nova requisicao
-					TransmitirRequisicaoUART();
 				}
 			}
 
