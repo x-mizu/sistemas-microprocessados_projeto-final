@@ -20,10 +20,12 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f1xx_hal.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdbool.h>
+#include "mx_prat_05_funcoes.h" // header do arqv das funcoes do programa
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DT_D 500					// delay dos leds
+#define DT_D 100					// delay dos leds
+#define DT_B 500
+#define reset_time 3000
+#define pa3_delay 3000
+#define min_delay 50
+#define tempoRespostaMAX 500 // tempo maximo de resposta
+#define tempoRequiscoes 200 // tempo entre requisicoes
+#define requisicoesCheckSumIncorretoMAX 3 // numero maximo de requisoces
+#define DT_VARRE 5 // inc varredura a cada 5 ms (~200 Hz)
+#define DIGITO_APAGADO 0x10 // kte valor p/ apagar um dígito no display
+#define MAX_MODO_OPER 2 // kte p/ testar val max modo_oper
+#define DT_UPDATE 200 // tempo delay para update do valor
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,22 +62,34 @@ UART_HandleTypeDef huart1;
 volatile uint8_t buffOut[4] = { 0, 0, 0, 0 }; // buffer de saida
 volatile uint8_t buffIn[4] = { 0, 0, 0, 0 }; // buffer de entrada
 volatile uint16_t valorConversorRecebido; // valor recebido pela UART
-volatile uint16_t valorConversor = (uint16_t) 0xFAFA; // valor do conversor
+volatile uint16_t val_adc = (uint16_t) 0xFAFA; // valor do conversor
 uint8_t r = (uint8_t) 0x72; // byte de requisicao
-uint8_t requisicoesCheckSumIncorretoMAX = 3; // numero maximo de requisoces
 volatile uint8_t requisicaoAtual = 1; // numero maximo de requisoces
-uint16_t tempoRespostaMAX = 500; // tempo maximo de resposta
-uint16_t tempoRequiscoes = 200; // tempo entre requisicoes
 volatile bool respostaRecebida = false;
 volatile bool requisicaoEnviada = false;
 volatile bool requisicaoTimeOutEnviada = false;
 
+volatile int mil = 0, // ini decimo
+		cen = 0, // ini unidade
+		dez = 0, // ini dezena
+		uni = 0; // ini unidade
+
 volatile static enum StatusUart {
 	TransmitirReq, Idle, ErroCheckSum, ErroConexao
 } statusUart = Idle;
+
 volatile static enum StatusPrograma {
-	Relogio, EditarRelogio, Conversor, ConexaoUART
-} statusPrograma = ConexaoUART;
+	Relogio,
+	EditarRelogioHora,
+	EditarRelogioMinuto,
+	Conversor,
+	ConexaoUART,
+	Reset
+} statusPrograma = Relogio;
+volatile static enum PA2_stat {
+	HOR, MIN
+} statusP2 = HOR;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -78,6 +103,18 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void TransmitirRequisicaoUART(void);
 void TransmitirDadosUART(void);
+int get_modo_oper_programa(void);
+// funcoes do arquivo stm32f1xx_it.c
+void set_modo_oper_conversor(int); // seta modo_oper (no stm32f1xx_it.c)
+int get_modo_oper_conversor(void); // obtém modo_oper (stm32f1xx_it.c)
+// funcoes do arquivo prat_05_funcoes.c
+void reset_pin_GPIOs(void); // reset pinos da SPI
+void serializar(int ser_data); // prot fn serializa dados p/ 74HC595
+int16_t conv_7_seg(int NumHex); // prot fn conv valor --> 7-seg
+void ConverteValorDoConversor(uint16_t val);
+void reset_modo_oper_programa(void);
+int get_modo_edicao_hora(void);
+void reset_modo_edicao_hora(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -92,6 +129,9 @@ void TransmitirDadosUART(void);
 int main(void) {
 	/* USER CODE BEGIN 1 */
 
+	int16_t val7seg = 0x00FF, // inicia 7-seg com 0xF (tudo apagado)
+			serial_data = 0x01FF; // dado a serializar (dig | val7seg)
+	uint32_t tIN_varre = 0; // registra tempo última varredura
 	/* USER CODE END 1 */
 
 	/* MCU Configuration--------------------------------------------------------*/
@@ -118,10 +158,18 @@ int main(void) {
 	/* Initialize interrupts */
 	MX_NVIC_Init();
 	/* USER CODE BEGIN 2 */
+	// inicializa a SPI (pinos 6,9,10 da GPIOB)
+	reset_pin_GPIOs();
+	// var de estado que controla a varredura (qual display é mostrado)
+	static enum {
+		DIG_UNI, DIG_DEC, DIG_CENS, DIG_MILS
+	} sttVARRE = DIG_UNI;
+
 	HAL_UART_Receive_IT(&huart1, buffIn, sizeof(buffIn)); // inicializa buffer de entrada
 
 	HAL_GPIO_WritePin(GPIOB,
-	GPIO_PIN_15 | GPIO_PIN_14 | GPIO_PIN_13 | GPIO_PIN_12 | GPIO_PIN_5, GPIO_PIN_SET); // desliga os leds
+	GPIO_PIN_15 | GPIO_PIN_14 | GPIO_PIN_13 | GPIO_PIN_12 | GPIO_PIN_5,
+			GPIO_PIN_SET); // desliga os leds
 
 	static enum {
 		INI_D1, LIG_D1, DSLG_D1
@@ -135,12 +183,34 @@ int main(void) {
 	static enum {
 		INI_D4, LIG_D4, DSLG_D4
 	} sttD4 = INI_D4; // var estados de D4
+	static enum {
+		INI_D, LIG_D, DSLG_D
+	} sttD = INI_D; // var estados de D
+	static enum {
+		INI_B, LIG_B, DSLG_B
+	} sttB = INI_B; // var estados de buzzer
+	static enum {
+		UNI, DEZ
+	} sttPonto = DEZ; // var ponto display
 
 	// para controlar vars tempos de entrada na rotina ON/OFF de cada LED
-	uint32_t tin_D1 = 0, tin_D2 = 0, tin_D3 = 0, tin_D4 = 0;
+	uint32_t tin_D1 = 0, tin_D2 = 0, tin_D3 = 0, tin_D4 = 0, tin_B = 0, tin_D =
+			0;
 
 	// para controlar as vezes que uma requisicao sera feita
 	uint32_t tin_UART = 0, timeOut_UART = 0;
+
+	uint8_t MINuni = 0, MINdec = 0, HRuni = 0, HRdec = 0;
+
+	uint32_t tin_min = 0;
+
+	uint32_t reset_A3 = 0;
+
+	bool PA3_pressionado = false;
+
+	uint32_t tin_conversor = 0;
+
+	int modoDeOperacao = 0;
 
 	/* USER CODE END 2 */
 
@@ -150,6 +220,218 @@ int main(void) {
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
+
+		// Botao PA 3 -----------------------------------------------------------
+		// atualiza status do programa de acordo com o modo de operacao EditarRelogio, Conversor, ConexaoUART, Reset
+		// Verifica se o botao PA3 esta apertado por 3 segundos
+		if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3) == 0) {
+			if (PA3_pressionado == false) {
+				reset_A3 = HAL_GetTick();
+				PA3_pressionado = true;
+			}
+			if ((HAL_GetTick() - reset_A3) >= reset_time) {
+				modoDeOperacao = 5;
+			}
+		} else {
+			PA3_pressionado = false;
+			modoDeOperacao = get_modo_oper_programa();
+		}
+
+		switch (modoDeOperacao) {
+		case 0:
+			statusPrograma = Relogio;
+			break;
+		case 1:
+			statusPrograma = EditarRelogioHora;
+			break;
+		case 2:
+			statusPrograma = EditarRelogioMinuto;
+			break;
+		case 3:
+			statusPrograma = Conversor;
+			break;
+		case 4:
+			statusPrograma = ConexaoUART;
+			break;
+		case 5:
+			statusPrograma = Reset;
+			break;
+		}
+		// --------------------------------------------------------------------------
+		// Contador do relogio ------------------------------------------------
+		if ((HAL_GetTick() - tin_min) >= min_delay
+				&& statusPrograma != EditarRelogioHora
+				&& statusPrograma != EditarRelogioMinuto) { //relógio incrementa minutos naturalmente
+			tin_min = HAL_GetTick();
+
+			if (MINuni == 9) {
+				MINuni = 0;
+				if (MINdec == 5) {
+					MINdec = 0;
+					if (HRuni == 3 && HRdec == 2) {
+						HRuni = 0;
+						HRdec = 0;
+					} else if (HRuni == 9) {
+						HRuni = 0;
+						HRdec++;
+					} else
+						HRuni++;
+
+				} else
+					MINdec++;
+			} else
+				MINuni++;
+		}
+
+		// --------------------------------------------------------------------------
+		// Mostra Relogio no Display---------------------------------------------
+		if (statusPrograma == Relogio) {
+			uni = HRdec;
+			dez = HRuni;
+			cen = MINdec;
+			mil = MINuni;
+			sttPonto = DEZ;
+			HAL_GPIO_WritePin(GPIOB,
+			GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+					GPIO_PIN_SET); // desl LED
+		}
+// --------------------------------------------------------------------------
+// Editar Relogio--------------------------------------------------------
+		if (statusPrograma == EditarRelogioHora) {
+			HAL_GPIO_WritePin(GPIOB,
+			GPIO_PIN_12 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET); // desl o LED
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); // desl o LED
+
+			uni = HRdec;
+			dez = HRuni;
+			cen = MINdec;
+			mil = MINuni;
+			sttPonto = DEZ;
+
+			if (get_modo_edicao_hora() == 1) {		// PA1 pressionado
+				if (HRuni == 3 && HRdec == 2) {	// caso esteja em 23h mudar para 00h
+					HRuni = 0;
+					HRdec = 0;
+				} else if (HRuni == 9) {
+					HRuni = 0;
+					HRdec++;
+				} else
+					HRuni++; 	// soma as horas
+			}
+			reset_modo_edicao_hora();
+		}
+
+		if (statusPrograma == EditarRelogioMinuto) {
+			HAL_GPIO_WritePin(GPIOB,
+			GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET); // desl o LED
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); // desl o LED
+
+			uni = HRdec;
+			dez = HRuni;
+			cen = MINdec;
+			mil = MINuni;
+			sttPonto = DEZ;
+
+			if (get_modo_edicao_hora() == 1) {		// PA1 pressionado
+				if (MINuni == 9) {
+					MINuni = 0;
+					if (MINdec == 5)
+						MINdec = 0;
+					else
+						MINdec++;
+				} else
+					MINuni++;	// soma os minutos
+			}
+			reset_modo_edicao_hora();
+		}
+// --------------------------------------------------------------------------
+// Conversor AD----------------------------------------------------------
+		if (statusPrograma == Conversor) {
+			sttPonto = UNI;
+			//tarefa #2: depois do IRQ ADC, converte para mVs (decimal, p/ 7-seg)
+			if ((HAL_GetTick() - tin_conversor) > DT_UPDATE) {
+				tin_conversor = HAL_GetTick();
+				ConverteValorDoConversor(val_adc);
+			}
+			HAL_GPIO_WritePin(GPIOB,
+			GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14, GPIO_PIN_SET); // desl o LED
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET); // desl o LED
+		}
+
+		// faz uma conversão ADC
+		if ((HAL_GetTick() - tin_conversor) > DT_UPDATE) {
+			// dispara por software uma conversão ADC
+			HAL_ADC_Start_IT(&hadc1); // dispara ADC p/ conversão por interrupção
+		}
+		// --------------------------------------------------------------------------
+
+// Atualiza display com o valor de uni, dez, cen e mil -----------------------
+		if ((HAL_GetTick() - tIN_varre) > DT_VARRE) // se ++0,1s atualiza o display
+		{
+			tIN_varre = HAL_GetTick(); // salva tIN p/ prox tempo varredura
+			switch (sttVARRE) // teste e escolha de qual DIG vai varrer
+			{
+			case DIG_MILS: {
+				sttVARRE = DIG_CENS; // ajusta p/ prox digito
+				serial_data = 0x0008; // display #1
+				val7seg = conv_7_seg(mil);
+				break;
+			}
+			case DIG_CENS: {
+				sttVARRE = DIG_DEC; // ajusta p/ prox digito
+				serial_data = 0x00004; // display #2
+				if (sttPonto == UNI) {
+					if (cen > 0 || dez > 0 || uni > 0) {
+						val7seg = conv_7_seg(cen);
+					} else {
+						val7seg = conv_7_seg(DIGITO_APAGADO);
+					}
+				} else {
+					val7seg = conv_7_seg(cen);
+				}
+
+				break;
+			}
+			case DIG_DEC: {
+				sttVARRE = DIG_UNI; // ajusta p/ prox digito
+				serial_data = 0x0002; // display #3
+				if (sttPonto == UNI) {
+					if (dez > 0 || uni > 0) {
+						val7seg = conv_7_seg(dez);
+						val7seg &= 0xFFFF;
+					} else {
+						val7seg = conv_7_seg(DIGITO_APAGADO);
+					}
+				} else {
+					val7seg = conv_7_seg(dez);
+					val7seg &= 0x7FFF; // liga o ponto decimal
+				}
+
+				break;
+			}
+			case DIG_UNI: {
+				sttVARRE = DIG_MILS; // ajusta p/ prox digito
+				serial_data = 0x0001; // display #3
+				if (sttPonto == UNI) {
+					if (uni > 0) {
+						val7seg = conv_7_seg(uni);
+						val7seg &= 0x7FFF; // liga o ponto decimal
+
+					} else {
+						val7seg = conv_7_seg(DIGITO_APAGADO);
+					}
+				} else {
+					val7seg = conv_7_seg(uni);
+					val7seg &= 0xFFFF;
+				}
+
+				break;
+			}
+			} // fim case
+			tIN_varre = HAL_GetTick(); // tmp atual em que fez essa varredura
+			serial_data |= val7seg; // OR com val7seg = dado a serializar
+			serializar(serial_data); // serializa dado p/74HC595 (shift reg)
+		} // -- fim da tarefa #3 - varredura do display
 
 		/// Conexao UART -------------------------------------------------------
 		if (statusPrograma == ConexaoUART) {
@@ -164,32 +446,67 @@ int main(void) {
 				break;
 			case TransmitirReq: // se o status for de enviar uma requisicao
 
-				if ((HAL_GetTick() - tin_UART)
-						> tempoRequiscoes && requisicaoEnviada == false) { // se for tempo de fazer uma requisicao
+				if ((HAL_GetTick() - tin_UART) > tempoRequiscoes
+						&& requisicaoEnviada == false) { // se for tempo de fazer uma requisicao
 					tin_UART = HAL_GetTick();
 					timeOut_UART = HAL_GetTick();
 					requisicaoEnviada = true;
 					TransmitirRequisicaoUART();
 				}
 
-				// se deu 500 ms, envia mais uma requisicao
-				if ((HAL_GetTick() - timeOut_UART)
-						> tempoRespostaMAX && requisicaoTimeOutEnviada == false) {
+// se deu 500 ms, envia mais uma requisicao
+				if ((HAL_GetTick() - timeOut_UART) > tempoRespostaMAX
+						&& requisicaoTimeOutEnviada == false) {
 					requisicaoTimeOutEnviada = true;
 					TransmitirRequisicaoUART();
 				}
 
-				// se depois da requisicao de 500ms, ainda nao recebi resposta depois de 500ms
-				// erro de conexao
+// se depois da requisicao de 500ms, ainda nao recebi resposta depois de 500ms
+// erro de conexao
 				if ((HAL_GetTick() - timeOut_UART) > 2 * tempoRespostaMAX) {
 					statusUart = ErroConexao;
+					HAL_GPIO_WritePin(GPIOB,
+					GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+							GPIO_PIN_SET); // desl o LED
 				}
 
-				// recebi resposta, reseta variaveis de requisicao
+// recebi resposta, reseta variaveis de requisicao
 				if (respostaRecebida == true) {
 					requisicaoTimeOutEnviada = false;
 					requisicaoEnviada = false;
 					respostaRecebida = false;
+					HAL_GPIO_WritePin(GPIOB,
+					GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_15, GPIO_PIN_SET); // desl o LED
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET); // desl o LED
+				}
+				if (requisicaoEnviada == true) {
+					switch (sttD) {
+					case INI_D:              // vai iniciar a máquina de estado
+						tin_D = HAL_GetTick(); // tempo inicial que iniciou a tarefa
+						sttD = LIG_D;            // prox estado da máquina
+						HAL_GPIO_WritePin(GPIOB,
+						GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+								GPIO_PIN_SET); // desl o LED
+						break;
+					case LIG_D:                 // estado para ligar o LED
+						if ((HAL_GetTick() - tin_D) > DT_D) {
+							tin_D = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+							sttD = DSLG_D;    // muda o prox estado da máquina
+							HAL_GPIO_WritePin(GPIOB,
+									GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14
+											| GPIO_PIN_15, GPIO_PIN_RESET); // ligaLED
+						}
+						break;
+					case DSLG_D:                // estado para desligar o LED
+						if ((HAL_GetTick() - tin_D) > DT_D) {
+							tin_D = HAL_GetTick(); // guarda tempo p/ prox mudança estado
+							sttD = LIG_D;     // muda o prox estado da máquina
+							HAL_GPIO_WritePin(GPIOB,
+									GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14
+											| GPIO_PIN_15, GPIO_PIN_SET); // desl LED
+						}
+						break;
+					};
 				}
 
 				break;
@@ -198,14 +515,16 @@ int main(void) {
 				case INI_D3: // vai iniciar a máquina de estado
 					tin_D3 = HAL_GetTick(); // tempo inicial que iniciou a tarefa
 					sttD3 = LIG_D3; // prox estado da máquina
-					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5, GPIO_PIN_SET); // desl o LED
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5,
+							GPIO_PIN_SET); // desl o LED
 					break;
 				case LIG_D3: // estado para ligar o LED
 					if ((HAL_GetTick() - tin_D3) > DT_D) // se for hora de ligar o led
 					{
 						tin_D3 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
 						sttD3 = DSLG_D3; // muda o prox estado da máquina
-						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5, GPIO_PIN_RESET); // ligaLED
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5,
+								GPIO_PIN_RESET); // ligaLED
 					}
 					break;
 				case DSLG_D3: // estado para desligar o LED
@@ -213,7 +532,8 @@ int main(void) {
 					{
 						tin_D3 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
 						sttD3 = LIG_D3; // muda o prox estado da máquina
-						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5, GPIO_PIN_SET); // desl LED
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13 | GPIO_PIN_5,
+								GPIO_PIN_SET); // desl LED
 					}
 					break;
 				}
@@ -223,14 +543,16 @@ int main(void) {
 				case INI_D4: // vai iniciar a máquina de estado
 					tin_D4 = HAL_GetTick(); // tempo inicial que iniciou a tarefa
 					sttD4 = LIG_D4; // prox estado da máquina
-					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5, GPIO_PIN_SET); // desl o LED
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5,
+							GPIO_PIN_SET); // desl o LED
 					break;
 				case LIG_D4: // estado para ligar o LED
 					if ((HAL_GetTick() - tin_D4) > DT_D) // se for hora de ligar o led
 					{
 						tin_D4 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
 						sttD4 = DSLG_D4; // muda o prox estado da máquina
-						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5, GPIO_PIN_RESET); // ligaLED
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5,
+								GPIO_PIN_RESET); // ligaLED
 					}
 					break;
 				case DSLG_D4: // estado para desligar o LED
@@ -238,14 +560,29 @@ int main(void) {
 					{
 						tin_D4 = HAL_GetTick(); // guarda tempo p/ prox mudança estado
 						sttD4 = LIG_D4; // muda o prox estado da máquina
-						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5, GPIO_PIN_SET); // desl LED
+						HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_5,
+								GPIO_PIN_SET); // desl LED
 					}
 					break;
 				}
-				break;
 			}
 		} else {
 			statusUart = Idle;
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET); // desl LED
+		}
+
+		// Reset ----------------------------------------------------------------
+		if (statusPrograma == Reset) {
+			statusUart = Idle;
+			respostaRecebida = false;
+			requisicaoEnviada = false;
+			requisicaoTimeOutEnviada = false;
+			HRuni = 0, HRdec = 0, MINuni = 0, MINdec = 0;
+			reset_modo_oper_programa();
+
+			HAL_GPIO_WritePin(GPIOB,
+			GPIO_PIN_15 | GPIO_PIN_14 | GPIO_PIN_13 | GPIO_PIN_12 | GPIO_PIN_5,
+					GPIO_PIN_SET); // desliga os leds
 		}
 
 	}
@@ -443,10 +780,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			respostaRecebida = true; // recebi uma resposta
 
 			if (checkSumCalculado == checkSumRecebido) { // se o checksum for correto
-				// salva valor recebido em uma variavel de 16 bits
+// salva valor recebido em uma variavel de 16 bits
 				valorConversorRecebido = ((uint16_t) buffIn[0] << 8)
 						| buffIn[1];
-
+				ConverteValorDoConversor(valorConversorRecebido);
 				requisicaoAtual = 1; // reseta variavel de requisicao para 1
 
 			} else { // se o valor recebido nao for o correto, envia outra requisicao
@@ -474,14 +811,30 @@ void TransmitirRequisicaoUART(void) {
 }
 
 void TransmitirDadosUART(void) {
-	buffOut[1] = (uint8_t) 0xFF & valorConversor;
-	buffOut[0] = (uint8_t) 0xFF & (valorConversor >> 8);
+	buffOut[1] = (uint8_t) 0xFF & val_adc;
+	buffOut[0] = (uint8_t) 0xFF & (val_adc >> 8);
 	uint16_t checkSum = (uint16_t) buffOut[0] + buffOut[1];
 
 	buffOut[3] = (uint8_t) 0xFF & checkSum;
 	buffOut[2] = (uint8_t) 0xFF & (checkSum >> 8);
 
 	HAL_UART_Transmit_IT(&huart1, buffOut, sizeof(buffOut)); // envia requisicao
+}
+
+void ConverteValorDoConversor(uint16_t val) {
+// converter o valor em decimais p/ display
+	uint32_t miliVolt = val * 3300 / 4095;
+	uni = miliVolt / 1000;
+	dez = (miliVolt - (uni * 1000)) / 100;
+	cen = (miliVolt - (uni * 1000) - (dez * 100)) / 10;
+	mil = miliVolt - (uni * 1000) - (dez * 100) - (cen * 10);
+}
+
+// fn que atende ao callback da ISR do conversor ADC1
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+	if (hadc->Instance == ADC1) {
+		val_adc = HAL_ADC_GetValue(&hadc1); // capta valor adc
+	}
 }
 /* USER CODE END 4 */
 
