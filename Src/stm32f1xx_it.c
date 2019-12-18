@@ -32,7 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define debouncing_time 200
+#define debouncing_time 200 // tempo para debounce
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,9 +44,9 @@
 /* USER CODE BEGIN PV */
 volatile uint32_t modo_oper_programa; // VAR modo_oper LOCAL
 volatile uint32_t modo_edicao_hora; // VAR modo_oper LOCAL
-volatile uint32_t tin_A1 = 0;
-volatile uint32_t tin_A2 = 0;
-volatile uint32_t tin_A3 = 0;
+volatile uint32_t tin_A1 = 0; // variavel auxiliar de debouncing
+volatile uint32_t tin_A2 = 0; // variavel auxiliar de debouncing
+volatile uint32_t tin_A3 = 0; // variavel auxiliar de debouncing
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -198,6 +198,7 @@ void EXTI1_IRQHandler(void) {
 				== 0&& (HAL_GetTick() - tin_A1) > debouncing_time) {
 			tin_A1 = HAL_GetTick();
 
+			// caso PA1 seja pressionado, muda modo de edicao de hora para 1
 			modo_edicao_hora = 1;
 	}
 	/* USER CODE END EXTI1_IRQn 0 */
@@ -215,6 +216,8 @@ void EXTI2_IRQHandler(void) {
 	if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2)
 			== 0&& (HAL_GetTick() - tin_A2) > debouncing_time) {
 		tin_A2 = HAL_GetTick();
+
+		// caso PA2 seja pressionado, muda o modo de operecao para editar relogio
 
 		switch (modo_oper_programa) {
 		case 0: // relogio
@@ -245,6 +248,8 @@ void EXTI3_IRQHandler(void) {
 	if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3)
 			== 0&& (HAL_GetTick() - tin_A3) > debouncing_time) {
 		tin_A3 = HAL_GetTick();
+
+		// caso PA3 seja pressionado, muda modo de operacao
 
 		switch (modo_oper_programa) {
 		case 0: // relogio
